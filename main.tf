@@ -1,0 +1,308 @@
+resource "aws_vpc" "vpc-01" {
+  cidr_block       = "10.0.0.0/16"
+  instance_tenancy = "default"
+
+  tags = {
+    Name = "kp-vpc"
+  }
+}
+resource "aws_subnet" "kp-sub-01" {
+  vpc_id     = aws_vpc.vpc-01.id
+  cidr_block = "10.0.1.0/24"
+
+  tags = {
+    Name = "kp-sub-pub-01"
+  }
+}
+resource "aws_subnet" "kp-sub-02" {
+  vpc_id     = aws_vpc.vpc-01.id
+  cidr_block = "10.0.2.0/24"
+
+  tags = {
+    Name = "kp-sub-prv-01"
+  }
+}
+
+resource "aws_internet_gateway" "kp-igw" {
+  vpc_id = aws_vpc.vpc-01.id
+
+  tags = {
+    Name = "kp-igw"
+  }
+}
+resource "aws_route_table" "kp-rt-pub" {
+  vpc_id = aws_vpc.vpc-01.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.kp-igw.id
+  }
+  tags = {
+    Name = "kp-rt-pub"
+  }
+}
+resource "aws_eip" "kp-nat-ip" {
+  vpc = true
+}
+resource "aws_nat_gateway" "kp-nat" {
+  allocation_id = aws_eip.kp-nat-ip.id
+  subnet_id     = aws_subnet.kp-sub-01.id
+
+  tags = {
+    Name = "kp-NAT"
+  }
+  depends_on = [aws_internet_gateway.kp-igw]
+}
+
+resource "aws_route_table" "kp-rt-prv" {
+  vpc_id = aws_vpc.vpc-01.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.kp-nat.id
+  }
+  tags = {
+    Name = "kp-rt-prv"
+  }
+}
+
+resource "aws_route_table_association" "kp-rt-asso-pub" {
+  subnet_id      = aws_subnet.kp-sub-01.id
+  route_table_id = aws_route_table.kp-rt-pub.id
+}
+resource "aws_security_group" "web-node" {
+  name        = "web-node"
+  description = "Web Security Group"
+  vpc_id      = aws_vpc.vpc-01.id
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+resource "aws_instance" "web-node" {
+  ami                         = "ami-02f3416038bdb17fb"
+  instance_type               = "t2.micro"
+  key_name                    = "kp-key-01"
+  iam_instance_profile        = aws_iam_instance_profile.kp1234_profile.name
+  vpc_security_group_ids      = [aws_security_group.web-node.id]
+  subnet_id                   = aws_subnet.kp-sub-01.id
+  associate_public_ip_address = true
+
+  provisioner "file" {
+    source      = "script.sh"
+    destination = "/tmp/script.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/script.sh",
+      "/tmp/script.sh",
+    ]
+  }
+  connection {
+    type        = "ssh"
+    host        = self.public_ip
+    user        = "ubuntu"
+    private_key = tls_private_key.kp-rsa.private_key_pem
+    timeout     = "4m"
+  }
+}
+
+
+resource "aws_iam_user" "kp-manju" {
+  name = "kp-manju"
+}
+resource "aws_iam_role_policy" "test_policy" {
+  name = "test_policy"
+  role = aws_iam_role.role.id
+
+  # Terraform's "jsonencode" function converts a
+  # Terraform expression result to valid JSON syntax.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "ec2:Describe*",
+        ]
+        Effect   = "Allow"
+        Resource = "*"
+      },
+    ]
+  })
+}
+resource "aws_iam_role" "role" {
+  name = "kp1234_role"
+  path = "/"
+
+  assume_role_policy = <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Action": "sts:AssumeRole",
+            "Principal": {
+               "Service": "ec2.amazonaws.com"
+            },
+            "Effect": "Allow",
+            "Sid": ""
+        }
+    ]
+}
+EOF
+}
+
+
+resource "aws_iam_instance_profile" "kp1234_profile" {
+  name = "kp1234_profile"
+  role = aws_iam_role.role.name
+}
+
+resource "aws_s3_bucket" "kp_s3" {
+  bucket = "karuthapandichellamani"
+  acl    = "public-read"
+}
+
+resource "tls_private_key" "kp-rsa" {
+  algorithm = "RSA"
+}
+
+resource "aws_key_pair" "kp-key-01" {
+  key_name   = "kp-key-01"
+  public_key = tls_private_key.kp-rsa.public_key_openssh
+}
+
+resource "local_file" "kp-file" {
+  content  = tls_private_key.kp-rsa.private_key_pem
+  filename = "kpkey.pem"
+}
+
+
+resource "aws_ebs_volume" "ebs1" {
+  availability_zone = aws_instance.web-node.availability_zone
+  size              = 1
+
+  tags = {
+    Name = "webebs"
+  }
+}
+
+resource "aws_volume_attachment" "ebs_att" {
+  device_name  = "/dev/sdh"
+  volume_id    = aws_ebs_volume.ebs1.id
+  instance_id  = aws_instance.web-node.id
+  force_detach = true
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    host        = aws_instance.web-node.public_ip
+    port        = 22
+    private_key = tls_private_key.kp-rsa.private_key_pem
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo mkfs.ext4 /dev/xvdh",
+      "sudo mount /dev/xvdh /var/www/html/",
+      "sudo git clone https://github.com/ckaruthapandi/image.git /var/www/html/",
+    ]
+  }
+}
+
+resource "aws_s3_bucket" "b" {
+  bucket = "karuthapandi-test"
+  acl    = "public-read"
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = "echo rmdir /Q /S image"
+  }
+
+
+  provisioner "local-exec" {
+    command = "git clone https://github.com/ckaruthapandi/image.git kp"
+  }
+
+  tags = {
+    Name = "kp"
+  }
+}
+
+resource "aws_s3_bucket_object" "image_upload" {
+  bucket = aws_s3_bucket.b.bucket
+  key    = "Elements-PNG-Transparent.png"
+  source = "kp/Elements-PNG-Transparent.png"
+  acl    = "public-read"
+}
+
+// Create Cloudfront
+
+locals {
+  s3_origin_id = "karuthapandi-test"
+  image_url    = "${aws_cloudfront_distribution.s3_distribution.domain_name}/${aws_s3_bucket_object.image_upload.key}"
+}
+
+resource "aws_cloudfront_distribution" "s3_distribution" {
+  origin {
+    domain_name = aws_s3_bucket.b.bucket_domain_name
+    origin_id   = local.s3_origin_id
+  }
+
+  default_cache_behavior {
+    allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = local.s3_origin_id
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+    viewer_protocol_policy = "allow-all"
+  }
+
+  enabled = true
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    host        = aws_instance.web-node.public_ip
+    port        = 22
+    private_key = tls_private_key.kp-rsa.private_key_pem
+  }
+  provisioner "remote-exec" {
+    inline = [
+      # "sudo su << \"EOF\" \n echo \"<img src='${self.domain_name}'>\" >> /var/www/html/index.html \n \"EOF\""
+      "sudo su << EOF",
+      "echo \"<img src='http://${self.domain_name}/${aws_s3_bucket_object.image_upload.key}' width=400 height=300>\" >> /var/www/html/index.html",
+      "EOF"
+    ]
+  }
+}
+
